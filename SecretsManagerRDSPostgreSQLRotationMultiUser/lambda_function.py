@@ -47,10 +47,15 @@ def lambda_handler(event, context):
 
         KeyError: If the secret json does not contain the expected keys
 
+        KeyError: If an expected environment variable is not configured
+
     """
     arn = event['SecretId']
     token = event['ClientRequestToken']
     step = event['Step']
+
+    cluster = os.environ['APPLICATION_CLUSTER']
+    families = os.environ['APPLICATION_FAMILIES'].split(',')
 
     # Setup the client
     service_client = boto3.client('secretsmanager', endpoint_url=os.environ['SECRETS_MANAGER_ENDPOINT'])
@@ -83,6 +88,7 @@ def lambda_handler(event, context):
 
     elif step == "finishSecret":
         finish_secret(service_client, arn, token)
+        redeploy_app(cluster, families)
 
     else:
         logger.error("lambda_handler: Invalid step parameter %s for secret %s" % (step, arn))
@@ -271,6 +277,51 @@ def finish_secret(service_client, arn, token):
     # Finalize by staging the secret version current
     service_client.update_secret_version_stage(SecretId=arn, VersionStage="AWSCURRENT", MoveToVersionId=token, RemoveFromVersionId=current_version)
     logger.info("finishSecret: Successfully set AWSCURRENT stage to version %s for secret %s." % (token, arn))
+
+
+def redeploy_app(cluster, families):
+    """Redeploy the application(s) that uses this database
+
+    Get the latest task definitions for each app passed and trigger a redeploy
+
+    Args:
+        cluster (string): The cluster we are deploying into
+        families (array): One or more application family we are going to redeploy
+
+    Returns:
+        Boolean: Did we deploy all of the apps?
+
+    Raises:
+        ValueError: If the taskDefinition key is not returned
+
+    """
+    # Create an ecs client
+    client = boto3.client('ecs')
+
+    for family in families:
+        # Get the active task definition
+        task_definition = client.describe_task_definition(taskDefinition=family).get('taskDefinition')
+
+        if task_definition == None:
+            raise ValueError("Unable to find key 'taskDefinition' when calling 'describe_task_definition(taskDefinition=%s)'." % family)
+
+        # Create a new task definition
+        client.register_task_definition(
+            containerDefinitions=task_definition['containerDefinitions'],
+            networkMode='awsvpc', family=family,
+            executionRoleArn=task_definition['executionRoleArn'],
+            requiresCompatibilities=['FARGATE'],
+            cpu=task_definition['cpu'],
+            memory=task_definition['memory']
+        )
+
+        # Update service to use the new task definition. Although we are making no changes to the task, this will allow
+        # our service to adopt the new password faster
+        client.update_service(
+            cluster=cluster,
+            service=family,
+            taskDefinition=family
+        )
 
 
 def get_connection(secret_dict):
